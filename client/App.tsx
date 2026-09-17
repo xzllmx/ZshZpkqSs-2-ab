@@ -31,7 +31,6 @@ import TasksPage from "./pages/TasksPage";
 import ReportsPage from "./pages/ReportsPage";
 import AccountsPage from "./pages/AccountsPage";
 import BooksPage from "./pages/BooksPage";
-import ZohoBooksCallbackPage from "./pages/ZohoBooksCallbackPage";
 import ReviewsPage from "./pages/ReviewsPage";
 import ConciergePage from "./pages/ConciergePage";
 import OffersPage from "./pages/OffersPage";
@@ -159,7 +158,6 @@ function App() {
               <Route path="/reports/performance" element={<ReportsPage />} />
               <Route path="/reports/vendors" element={<ReportsPage />} />
               <Route path="/books" element={<BooksPage />} />
-              <Route path="/books/callback" element={<ZohoBooksCallbackPage />} />
               <Route path="/accounts/*" element={<AccountsPage />} />
               <Route path="/accounts/vendors" element={<AccountsPage />} />
               <Route path="/accounts/quotes" element={<AccountsPage />} />

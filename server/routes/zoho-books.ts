@@ -4,7 +4,7 @@ import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 const zohoAccountsUrl = process.env.ZOHO_ACCOUNTS_URL || "https://accounts.zoho.com";
 const zohoApiUrl = process.env.ZOHO_BOOKS_API_URL || "https://www.zohoapis.com/books/v3";
-const redirectPath = "/books/callback";
+const callbackPath = "/api/zoho/books/callback";
 
 type ZohoIntegration = {
   user_id: string;
@@ -16,34 +16,36 @@ type ZohoIntegration = {
   connected_at: string | null;
 };
 
-const getConfig = () => {
-  const clientId = process.env.APP_ZOHO_CLIENT_ID || process.env.ZOHO_CLIENT_ID || process.env.VITE_ZOHO_CLIENT_ID;
-  const clientSecret = process.env.APP_ZOHO_CLIENT_SECRET || process.env.ZOHO_CLIENT_SECRET;
-  const redirectUri = process.env.APP_ZOHO_REDIRECT_URI || process.env.ZOHO_REDIRECT_URI || process.env.VITE_ZOHO_REDIRECT_URI;
-  const supabaseUrl = process.env.APP_SUPABASE_URL || process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-  let serviceRoleKey = process.env.APP_SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+type OAuthState = {
+  userId: string;
+  returnTo: string;
+  expiresAt: number;
+};
 
-  if (!serviceRoleKey && process.env.SUPABASE_SECRET_KEYS) {
-    try {
-      const secretKeys = JSON.parse(process.env.SUPABASE_SECRET_KEYS) as Record<string, string>;
-      serviceRoleKey = secretKeys.service_role || secretKeys.default || secretKeys.SUPABASE_SERVICE_ROLE_KEY;
-    } catch {
-      throw new Error("SUPABASE_SECRET_KEYS is not valid JSON");
-    }
-  }
+const getConfig = () => {
+  const clientId = process.env.ZOHO_CLIENT_ID;
+  const clientSecret = process.env.ZOHO_CLIENT_SECRET;
+  const redirectUri = process.env.ZOHO_REDIRECT_URI;
+  const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   const missing: string[] = [];
-  if (!clientId) missing.push("ZOHO_CLIENT_ID (or VITE_ZOHO_CLIENT_ID)");
+  if (!clientId) missing.push("ZOHO_CLIENT_ID");
   if (!clientSecret) missing.push("ZOHO_CLIENT_SECRET");
-  if (!redirectUri) missing.push("ZOHO_REDIRECT_URI (or VITE_ZOHO_REDIRECT_URI)");
-  if (!supabaseUrl) missing.push("APP_SUPABASE_URL");
-  if (!serviceRoleKey) missing.push("APP_SUPABASE_SECRET_KEY");
+  if (!redirectUri) missing.push("ZOHO_REDIRECT_URI");
+  if (!supabaseUrl) missing.push("SUPABASE_URL or VITE_SUPABASE_URL");
+  if (!serviceRoleKey) missing.push("SUPABASE_SERVICE_ROLE_KEY");
 
   if (missing.length > 0) {
     throw new Error(`Zoho Books server configuration is incomplete. Missing server variable(s): ${missing.join(", ")}`);
   }
 
-  return { clientId, clientSecret, redirectUri, supabaseUrl, serviceRoleKey };
+  const configuredRedirectUri = new URL(redirectUri);
+  if (configuredRedirectUri.protocol !== "https:" || configuredRedirectUri.pathname !== callbackPath) {
+    throw new Error(`ZOHO_REDIRECT_URI must use HTTPS and target ${callbackPath}`);
+  }
+
+  return { clientId, clientSecret, redirectUri: configuredRedirectUri.toString(), supabaseUrl, serviceRoleKey };
 };
 
 const getAdminClient = () => {
@@ -77,27 +79,66 @@ const requireUser = async (authorization: string | undefined, res: Parameters<Re
   return userId;
 };
 
-const encodeState = (userId: string) => {
+const getRequestOrigin = (req: Parameters<RequestHandler>[0]) => {
+  const protocol = req.headers["x-forwarded-proto"]?.toString().split(",")[0] || req.protocol;
+  return `${protocol}://${req.get("host")}`;
+};
+
+const getReturnTo = (req: Parameters<RequestHandler>[0]) => {
+  const fallback = new URL("/books", getRequestOrigin(req));
+  const requestedReturnTo = typeof req.query.returnTo === "string" ? req.query.returnTo : "";
+  if (!requestedReturnTo) return fallback.toString();
+
+  const allowedOrigins = new Set([getRequestOrigin(req)]);
+  for (const origin of (process.env.ZOHO_ALLOWED_RETURN_ORIGINS || "").split(",")) {
+    if (!origin.trim()) continue;
+    allowedOrigins.add(new URL(origin.trim()).origin);
+  }
+
+  try {
+    const returnTo = new URL(requestedReturnTo);
+    if (returnTo.protocol !== "https:" || !allowedOrigins.has(returnTo.origin)) return fallback.toString();
+    returnTo.searchParams.delete("connected");
+    returnTo.searchParams.delete("error");
+    return returnTo.toString();
+  } catch {
+    return fallback.toString();
+  }
+};
+
+const encodeState = (state: OAuthState) => {
   const { clientSecret } = getConfig();
-  const payload = Buffer.from(JSON.stringify({ userId, expiresAt: Date.now() + 10 * 60 * 1000 })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify(state)).toString("base64url");
   const signature = crypto.createHmac("sha256", clientSecret).update(payload).digest("base64url");
   return `${payload}.${signature}`;
 };
 
-const verifyState = (state: string, userId: string) => {
+const verifyState = (state: string): OAuthState => {
   const { clientSecret } = getConfig();
-  const [payload, signature] = state.split(".");
-  if (!payload || !signature) return false;
+  const [payload, signature, ...rest] = state.split(".");
+  if (!payload || !signature || rest.length > 0) throw new Error("Invalid Zoho authorization state");
+
   const expected = crypto.createHmac("sha256", clientSecret).update(payload).digest("base64url");
   const receivedBuffer = Buffer.from(signature);
   const expectedBuffer = Buffer.from(expected);
-  if (receivedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(receivedBuffer, expectedBuffer)) return false;
+  if (receivedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(receivedBuffer, expectedBuffer)) {
+    throw new Error("Invalid Zoho authorization state");
+  }
 
-  const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
-    userId: string;
-    expiresAt: number;
-  };
-  return parsed.userId === userId && parsed.expiresAt > Date.now();
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Partial<OAuthState>;
+    if (
+      typeof parsed.userId !== "string" ||
+      typeof parsed.returnTo !== "string" ||
+      typeof parsed.expiresAt !== "number" ||
+      parsed.expiresAt <= Date.now()
+    ) {
+      throw new Error("Invalid Zoho authorization state");
+    }
+    return { userId: parsed.userId, returnTo: parsed.returnTo, expiresAt: parsed.expiresAt };
+  } catch {
+    throw new Error("Invalid Zoho authorization state");
+  }
 };
 
 const getIntegration = async (admin: SupabaseClient, userId: string) => {
@@ -181,7 +222,11 @@ export const startZohoBooksConnect: RequestHandler = async (req, res) => {
       scope: "ZohoBooks.contacts.READ,ZohoBooks.invoices.READ,ZohoBooks.settings.READ",
       access_type: "offline",
       prompt: "consent",
-      state: encodeState(userId),
+      state: encodeState({
+        userId,
+        returnTo: getReturnTo(req),
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      }),
     });
     res.json({ url: `${zohoAccountsUrl}/oauth/v2/auth?${params.toString()}` });
   } catch (error) {
@@ -189,9 +234,7 @@ export const startZohoBooksConnect: RequestHandler = async (req, res) => {
   }
 };
 
-const completeAuthorization = async (userId: string, code: string, state: string) => {
-  if (!verifyState(state, userId)) throw new Error("Invalid or expired Zoho authorization");
-
+const completeAuthorization = async (userId: string, code: string) => {
   const { clientId, clientSecret, redirectUri } = getConfig();
   const response = await fetch(`${zohoAccountsUrl}/oauth/v2/token`, {
     method: "POST",
@@ -228,47 +271,27 @@ const completeAuthorization = async (userId: string, code: string, state: string
   }
 };
 
-const getStateUserId = (state: string) => {
-  const [payload] = state.split(".");
-  if (!payload) throw new Error("Invalid Zoho authorization state");
-  const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { userId?: string };
-  if (!parsed.userId) throw new Error("Invalid Zoho authorization state");
-  return parsed.userId;
-};
-
-const getBooksRedirectUri = (req: Parameters<RequestHandler>[0], error?: string) => {
-  const protocol = req.headers["x-forwarded-proto"]?.toString().split(",")[0] || req.protocol;
-  const booksUrl = new URL("/books", `${protocol}://${req.get("host")}`);
-  booksUrl.search = error ? `?error=${encodeURIComponent(error)}` : "?connected=1";
+const getBooksRedirectUri = (returnTo: string, error?: string) => {
+  const booksUrl = new URL(returnTo);
+  booksUrl.searchParams.delete("connected");
+  booksUrl.searchParams.delete("error");
+  booksUrl.searchParams.set(error ? "error" : "connected", error || "1");
   return booksUrl.toString();
 };
 
 export const completeZohoBooksCallback: RequestHandler = async (req, res) => {
   const code = typeof req.query.code === "string" ? req.query.code : "";
   const state = typeof req.query.state === "string" ? req.query.state : "";
-  try {
-    if (!code || !state) throw new Error("Zoho authorization was not completed");
-    const userId = getStateUserId(state);
-    await completeAuthorization(userId, code, state);
-    res.redirect(302, getBooksRedirectUri(req));
-  } catch (error) {
-    res.redirect(302, getBooksRedirectUri(req, "authorization"));
-  }
-};
+  let returnTo = new URL("/books", getRequestOrigin(req)).toString();
 
-export const completeZohoBooksConnect: RequestHandler = async (req, res) => {
   try {
-    const userId = await requireUser(req.headers.authorization, res);
-    if (!userId) return;
-    const { code, state } = req.body as { code?: string; state?: string };
-    if (!code || !state) {
-      res.status(400).json({ error: "Invalid or expired Zoho authorization" });
-      return;
-    }
-    await completeAuthorization(userId, code, state);
-    res.json({ connected: true });
-  } catch (error) {
-    res.status(500).json({ error: error instanceof Error ? error.message : "Unable to complete Zoho connection" });
+    const authorization = verifyState(state);
+    returnTo = authorization.returnTo;
+    if (!code) throw new Error("Zoho authorization was not completed");
+    await completeAuthorization(authorization.userId, code);
+    res.redirect(302, getBooksRedirectUri(returnTo));
+  } catch {
+    res.redirect(302, getBooksRedirectUri(returnTo, "authorization"));
   }
 };
 
