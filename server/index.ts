@@ -9,7 +9,6 @@ import {
 } from "./routes/flutterwave.js";
 import {
   completeZohoBooksCallback,
-  completeZohoBooksConnect,
   disconnectZohoBooks,
   getZohoBooksData,
   getZohoBooksStatus,
@@ -36,8 +35,6 @@ export function createServer() {
   app.post("/api/payments/flutterwave/webhook", handleFlutterwaveWebhook);
   app.get("/api/zoho/books/connect", startZohoBooksConnect);
   app.get("/api/zoho/books/callback", completeZohoBooksCallback);
-  app.get("/books/callback", completeZohoBooksCallback);
-  app.post("/api/zoho/books/callback", completeZohoBooksConnect);
   app.get("/api/zoho/books/status", getZohoBooksStatus);
   app.get("/api/zoho/books/data", getZohoBooksData);
   app.post("/api/zoho/books/disconnect", disconnectZohoBooks);

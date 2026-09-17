@@ -67,7 +67,11 @@ const BooksPage = () => {
         navigate(`/login?returnTo=${encodeURIComponent("/books")}`);
         return;
       }
-      const response = await fetch("/api/zoho/books/connect", { headers: { Authorization: `Bearer ${token}` } });
+      const returnTo = window.location.href;
+      const response = await fetch(
+        `/api/zoho/books/connect?${new URLSearchParams({ returnTo })}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
       const body = await response.json();
       if (!response.ok || !body.url) throw new Error(body.error || "Unable to start Zoho authorization");
       setAuthorizationUrl(body.url);
